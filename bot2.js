@@ -187,7 +187,7 @@ bot.command('start', ctx => {
     '/delete <address|label> — Remove from watchlist\n' +
     '/list — Show all tracked addresses\n' +
     '/check <address|label> — Show positions'
-  ctx.replyWithMarkdown(helpMessage)
+  ctx.reply(helpMessage)
 })
 
 bot.command('check', async ctx => {
@@ -244,7 +244,7 @@ bot.command('list', ctx => {
   const formatted = Object.entries(watchlist)
     .map(([addr, lbl]) => `${lbl || '(no label)'}: \`${addr}\``)
     .join('\n')
-  ctx.replyWithMarkdownV2(`*List of tracked wallets:*\n\n${formatted}`)
+  ctx.reply(`List of tracked wallets:\n\n${formatted}`)
 })
 
 // Add error handling for the monitoring loop
