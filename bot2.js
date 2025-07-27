@@ -122,11 +122,11 @@ function formatPositionsMono(positions) {
     const posValueStr = pos.position_value ? pos.position_value.toFixed(2) : 'N/A'
     return (
       `${symbol.padEnd(6)} ${formatSideEmoji(pos.sign)}\n` +
-      `Size:  ${String(pos.position).padEnd(8)}\n` +
-      `Pos.Value: $${posValueStr.padEnd(8)}\n` +
-      `Avg.Entry: $${String(pos.avg_entry_price).padEnd(8)}\n` +
-      `Mark Price: $${markPriceStr.padEnd(8)}\n` +
-      `PNL: ${pnlFormatted.padEnd(8)}$\n` +
+      `Sz:  ${String(pos.position).padEnd(8)}\n` +
+      `Ent: ${String(pos.avg_entry_price).padEnd(8)}\n` +
+      `Mark: ${markPriceStr.padEnd(8)}\n` +
+      `Val: ${posValueStr.padEnd(8)}\n` +
+      `PNL: ${pnlFormatted.padEnd(8)}\n` +
       `Orders: ${pos.open_order_count}`
     )
   })
@@ -157,21 +157,21 @@ function comparePositions(oldPos, newPos) {
     const o = oldPositions[sym]
     const n = newPositions[sym]
     if (!o && n) {
-      const markPriceStr = n.mark_price ? `\n*Mark:* ${n.mark_price}` : ''
-      const posValueStr = n.position_value ? `\n*Value:* ${n.position_value.toFixed(2)}` : ''
-      messages.push(`✅ *Opened* ${formatSideEmoji(n.sign)} position on *${sym}*\n\n*Size:* ${n.position}\n*Entry:* ${n.avg_entry_price}${markPriceStr}${posValueStr}\n*PNL:* ${n.unrealized_pnl.toFixed(4)}\n*Orders:* ${n.open_order_count}`)
+      const markPriceStr = n.mark_price ? `\nMark: ${n.mark_price}` : ''
+      const posValueStr = n.position_value ? `\nValue: ${n.position_value.toFixed(2)}` : ''
+      messages.push(`✅ Opened ${formatSideEmoji(n.sign)} position on ${sym}\n\nSize: ${n.position}\nEntry: ${n.avg_entry_price}${markPriceStr}${posValueStr}\nPNL: ${n.unrealized_pnl.toFixed(4)}\nOrders: ${n.open_order_count}`)
     } else if (o && !n) {
-      messages.push(`❌ *Closed* position on *${sym}*\n\n*Was:* ${formatSideEmoji(o.sign)} ${o.position} @ ${o.avg_entry_price}`)
+      messages.push(`❌ Closed position on ${sym}\n\nWas: ${formatSideEmoji(o.sign)} ${o.position} @ ${o.avg_entry_price}`)
     } else if (o && n && (o.position !== n.position || o.avg_entry_price !== n.avg_entry_price)) {
       const dir = n.position > o.position ? 'Increased' : 'Reduced'
       const direction = n.sign === 1 ? 'Long' : 'Short'
-      let msg = `🔄 *${dir}* ${direction} position on *${sym}*\n\n*Size:* ${o.position} → ${n.position}`
+      let msg = `🔄 ${dir} ${direction} position on ${sym}\n\nSize: ${o.position} → ${n.position}`
       if (o.avg_entry_price !== n.avg_entry_price) {
-        msg += `\n*Entry Price:* ${o.avg_entry_price} → ${n.avg_entry_price}`
+        msg += `\nEntry Price: ${o.avg_entry_price} → ${n.avg_entry_price}`
       }
-      const markPriceStr = n.mark_price ? `\n*Mark:* ${n.mark_price}` : ''
-      const posValueStr = n.position_value ? `\n*Value:* ${n.position_value.toFixed(2)}` : ''
-      msg += `${markPriceStr}${posValueStr}\n*PNL:* ${n.unrealized_pnl.toFixed(4)}\n*Orders:* ${n.open_order_count}`
+      const markPriceStr = n.mark_price ? `\nMark: ${n.mark_price}` : ''
+      const posValueStr = n.position_value ? `\nValue: ${n.position_value.toFixed(2)}` : ''
+      msg += `${markPriceStr}${posValueStr}\nPNL: ${n.unrealized_pnl.toFixed(4)}\nOrders: ${n.open_order_count}`
       messages.push(msg)
     }
   })
@@ -261,8 +261,7 @@ setInterval(async () => {
           const label = watchlist[address] ? ` (${watchlist[address]})` : ''
           await bot.telegram.sendMessage(
             CHAT_ID,
-            `📡 Update for ${address}${label}\n\n` + diffs.join('\n\n'),
-            { parse_mode: 'Markdown' }
+            `📡 Update for ${address}${label}\n\n` + diffs.join('\n\n')
           )
         }
 
