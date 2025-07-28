@@ -20,21 +20,13 @@ const CONFIG = {
   CACHE_DURATION: 30000 // 30 секунд кеш для API запросов
 }
 
-// Whitelist конфигурация
-const WHITELIST_CONFIG = {
-  ENABLED: true, // включить/выключить whitelist
-  MAX_ADDRESSES_WHITELISTED: 50, // лимит для whitelisted пользователей (или 0 для безлимита)
-  RATE_LIMIT_WHITELISTED: 100 // лимит команд в минуту для whitelisted (или 0 для безлимита)
-}
-
 const bot = new Telegraf(BOT_TOKEN)
 bot.telegram.setMyCommands([
   { command: 'start', description: 'Menu and help' },
-  { command: 'add', description: 'Add address with optional label' },
+  { command: 'add', description: 'Add address with optional label (max 5)' },
   { command: 'delete', description: 'Remove address from tracking' },
   { command: 'list', description: 'Show all your tracked addresses' },
-  { command: 'check', description: 'Show positions for address or label' },
-  { command: 'status', description: 'Show your account status and limits' }
+  { command: 'check', description: 'Show positions for address or label' }
 ])
 
 const STATE_FILE = './state.json'
@@ -119,48 +111,39 @@ function saveRateLimits(limits) {
   }
 }
 
-// Функции для работы с whitelist
+// Тихая проверка whitelist
 function loadWhitelist() {
   try {
     const data = JSON.parse(fs.readFileSync(WHITELIST_FILE))
     return Array.isArray(data) ? data : []
   } catch {
-    return []
-  }
-}
-
-function saveWhitelist(whitelist) {
-  try {
-    fs.writeFileSync(WHITELIST_FILE, JSON.stringify(whitelist, null, 2))
-  } catch (error) {
-    console.error('Error saving whitelist:', error)
+    // Создаем пустой файл whitelist.json если его нет
+    const emptyWhitelist = []
+    try {
+      fs.writeFileSync(WHITELIST_FILE, JSON.stringify(emptyWhitelist, null, 2))
+    } catch (error) {
+      console.error('Error creating whitelist file:', error)
+    }
+    return emptyWhitelist
   }
 }
 
 function isWhitelisted(userId) {
-  if (!WHITELIST_CONFIG.ENABLED) return false
   const whitelist = loadWhitelist()
   return whitelist.includes(userId)
 }
 
 function getUserLimits(userId) {
-  const whitelisted = isWhitelisted(userId)
-  return {
-    maxAddresses: whitelisted ? 
-      (WHITELIST_CONFIG.MAX_ADDRESSES_WHITELISTED || Infinity) : 
-      CONFIG.MAX_ADDRESSES_PER_USER,
-    rateLimit: whitelisted ? 
-      (WHITELIST_CONFIG.RATE_LIMIT_WHITELISTED || Infinity) : 
-      CONFIG.RATE_LIMIT_PER_USER,
-    isWhitelisted: whitelisted
+  if (isWhitelisted(userId)) {
+    return {
+      maxAddresses: Infinity,
+      rateLimit: Infinity
+    }
   }
-}
-
-// Команды для управления whitelist (только для владельца бота)
-function isOwner(userId) {
-  // Замените на ваш Telegram ID
-  const OWNER_ID = parseInt(process.env.OWNER_ID) || 0
-  return userId === OWNER_ID
+  return {
+    maxAddresses: CONFIG.MAX_ADDRESSES_PER_USER,
+    rateLimit: CONFIG.RATE_LIMIT_PER_USER
+  }
 }
 
 // Rate limiting middleware с учетом whitelist
@@ -433,8 +416,7 @@ bot.use(async (ctx, next) => {
   if (!userId) return
   
   if (!checkRateLimit(userId)) {
-    const limits = getUserLimits(userId)
-    return ctx.reply(`⚠️ Too many requests. Please wait a minute before trying again.\n\n${limits.isWhitelisted ? '👑 Whitelisted' : '👤 Regular'} user limit: ${limits.rateLimit === Infinity ? '∞' : limits.rateLimit} requests/min`)
+    return ctx.reply('⚠️ Too many requests. Please wait a minute before trying again.')
   }
   
   try {
@@ -448,50 +430,19 @@ bot.use(async (ctx, next) => {
 let previousStates = loadState()
 
 bot.command('start', ctx => {
-  const userId = ctx.from.id
-  const limits = getUserLimits(userId)
-  
   const helpMessage = '*Welcome to ZkLighter Position Tracker!*\n\n' +
     'This bot tracks your positions and sends updates.\n\n' +
     '*Available commands:*\n\n' +
-    '/add <address> [label] — Add address to your watchlist\n' +
+    '/add <address> [label] — Add address to your watchlist (max 5)\n' +
     '/delete <address|label> — Remove from your watchlist\n' +
     '/list — Show all your tracked addresses\n' +
-    '/check <address|label> — Show current positions\n' +
-    '/status — Show your account status and limits\n\n' +
-    '*Your limits:*\n' +
-    `${limits.isWhitelisted ? '👑' : '👤'} Account type: ${limits.isWhitelisted ? 'Whitelisted' : 'Regular'}\n` +
-    `• Maximum addresses: ${limits.maxAddresses === Infinity ? '∞' : limits.maxAddresses}\n` +
-    `• Commands per minute: ${limits.rateLimit === Infinity ? '∞' : limits.rateLimit}\n` +
+    '/check <address|label> — Show current positions\n\n' +
+    '*Limits:*\n' +
+    `• Maximum ${CONFIG.MAX_ADDRESSES_PER_USER} addresses per user\n` +
+    `• Maximum ${CONFIG.RATE_LIMIT_PER_USER} commands per minute\n` +
     '• Position updates every 15 seconds'
   
   ctx.reply(helpMessage, { parse_mode: 'Markdown' })
-})
-
-bot.command('status', ctx => {
-  const userId = ctx.from.id
-  const limits = getUserLimits(userId)
-  const watchlist = loadWatchlist()
-  const userAddresses = watchlist[userId] || {}
-  const addressCount = Object.keys(userAddresses).length
-  
-  const rateLimitData = rateLimits.get(userId) || { requests: [] }
-  const currentRequests = rateLimitData.requests.filter(time => Date.now() - time < 60000).length
-  
-  let message = `📊 *Your Account Status*\n\n`
-  message += `${limits.isWhitelisted ? '👑' : '👤'} *Account Type:* ${limits.isWhitelisted ? 'Whitelisted' : 'Regular'}\n\n`
-  message += `📱 *Usage:*\n`
-  message += `• Tracked addresses: ${addressCount}/${limits.maxAddresses === Infinity ? '∞' : limits.maxAddresses}\n`
-  message += `• Recent requests: ${currentRequests}/${limits.rateLimit === Infinity ? '∞' : limits.rateLimit} (last minute)\n\n`
-  
-  if (limits.isWhitelisted) {
-    message += `✨ *Whitelisted Benefits:*\n`
-    message += `• ${limits.maxAddresses === Infinity ? 'Unlimited' : 'Extended'} wallet tracking\n`
-    message += `• ${limits.rateLimit === Infinity ? 'Unlimited' : 'Higher'} rate limits\n`
-    message += `• Priority support\n`
-  }
-  
-  ctx.reply(message, { parse_mode: 'Markdown' })
 })
 
 bot.command('check', async ctx => {
@@ -543,7 +494,7 @@ bot.command('add', async ctx => {
   const limits = getUserLimits(userId)
   
   if (Object.keys(userAddresses).length >= limits.maxAddresses) {
-    return ctx.reply(`❌ Maximum ${limits.maxAddresses === Infinity ? '∞' : limits.maxAddresses} addresses allowed for ${limits.isWhitelisted ? 'whitelisted' : 'regular'} users.`)
+    return ctx.reply(`❌ Maximum ${CONFIG.MAX_ADDRESSES_PER_USER} addresses allowed per user.`)
   }
 
   // Проверяем, не добавлен ли уже этот адрес
@@ -562,12 +513,12 @@ bot.command('add', async ctx => {
     previousStates[address] = initialState
     saveState(previousStates)
     
-    const maxDisplay = limits.maxAddresses === Infinity ? '∞' : limits.maxAddresses
-    ctx.reply(`✅ Added ${address}${label ? ' as ' + label : ''}\n\n${limits.isWhitelisted ? '👑' : '📱'} Addresses: ${Object.keys(userAddresses).length}/${maxDisplay}\n\n🔄 Monitoring started - you'll receive updates for any position changes.`)
+    const maxDisplay = limits.maxAddresses === Infinity ? Object.keys(userAddresses).length : `${Object.keys(userAddresses).length}/${CONFIG.MAX_ADDRESSES_PER_USER}`
+    ctx.reply(`✅ Added ${address}${label ? ' as ' + label : ''}\n\nAddresses: ${maxDisplay}\n\n🔄 Monitoring started - you'll receive updates for any position changes.`)
   } catch (error) {
     console.error('Error initializing state for new address:', error)
-    const maxDisplay = limits.maxAddresses === Infinity ? '∞' : limits.maxAddresses
-    ctx.reply(`✅ Added ${address}${label ? ' as ' + label : ''}\n\n${limits.isWhitelisted ? '👑' : '📱'} Addresses: ${Object.keys(userAddresses).length}/${maxDisplay}\n\n⚠️ Warning: Could not fetch initial state. You may receive notifications about existing positions on first check.`)
+    const maxDisplay = limits.maxAddresses === Infinity ? Object.keys(userAddresses).length : `${Object.keys(userAddresses).length}/${CONFIG.MAX_ADDRESSES_PER_USER}`
+    ctx.reply(`✅ Added ${address}${label ? ' as ' + label : ''}\n\nAddresses: ${maxDisplay}\n\n⚠️ Warning: Could not fetch initial state. You may receive notifications about existing positions on first check.`)
   }
 })
 
@@ -598,8 +549,8 @@ bot.command('delete', ctx => {
   
   const limits = getUserLimits(userId)
   const count = Object.keys(userAddresses).length
-  const maxDisplay = limits.maxAddresses === Infinity ? '∞' : limits.maxAddresses
-  ctx.reply(`✅ Removed ${addr}\n\n${limits.isWhitelisted ? '👑' : '📱'} Addresses: ${count}/${maxDisplay}`)
+  const maxDisplay = limits.maxAddresses === Infinity ? count : `${count}/${CONFIG.MAX_ADDRESSES_PER_USER}`
+  ctx.reply(`✅ Removed ${addr}\n\nAddresses: ${maxDisplay}`)
 })
 
 bot.command('list', ctx => {
@@ -617,68 +568,109 @@ bot.command('list', ctx => {
     .join('\n')
   
   const count = Object.keys(userAddresses).length
-  const maxDisplay = limits.maxAddresses === Infinity ? '∞' : limits.maxAddresses
-  ctx.reply(`📋 *Your tracked wallets (${count}/${maxDisplay}):*\n${limits.isWhitelisted ? '👑 Whitelisted Account' : ''}\n\n${formatted}`, { parse_mode: 'Markdown' })
+  const maxDisplay = limits.maxAddresses === Infinity ? count : `${count}/${CONFIG.MAX_ADDRESSES_PER_USER}`
+  ctx.reply(`📋 *Your tracked wallets (${maxDisplay}):*\n\n${formatted}`, { parse_mode: 'Markdown' })
 })
 
-// Команды для управления whitelist (только для владельца)
-bot.command('whitelist_add', ctx => {
-  if (!isOwner(ctx.from.id)) return ctx.reply('❌ Only bot owner can use this command.')
-  
-  const targetUserId = parseInt(ctx.message.text.split(' ')[1])
-  if (!targetUserId) return ctx.reply('Usage: /whitelist_add user_id')
-  
-  const whitelist = loadWhitelist()
-  if (whitelist.includes(targetUserId)) {
-    return ctx.reply(`User ${targetUserId} is already whitelisted.`)
+// Мониторинг
+setInterval(async () => {
+  try {
+    const watchlist = loadWatchlist()
+    const allPromises = []
+    
+    // Собираем все адреса от всех пользователей
+    const addressToUsers = new Map()
+    Object.entries(watchlist).forEach(([userId, userAddresses]) => {
+      Object.keys(userAddresses).forEach(address => {
+        if (!addressToUsers.has(address)) {
+          addressToUsers.set(address, [])
+        }
+        addressToUsers.get(address).push(userId)
+      })
+    })
+    
+    // Проверяем каждый уникальный адрес только один раз
+    for (const [address, userIds] of addressToUsers) {
+      allPromises.push(
+        (async () => {
+          try {
+            const newState = await fetchPositions(address)
+            const oldState = previousStates[address] || { positions: {} }
+            const diffs = comparePositions(oldState, newState)
+
+            if (diffs.length > 0) {
+              // Отправляем уведомления всем пользователям, отслеживающим этот адрес
+              for (const userId of userIds) {
+                try {
+                  const userAddresses = watchlist[userId] || {}
+                  
+                  await bot.telegram.sendMessage(
+                    userId,
+                    `📍 <b>${userAddresses[address] || 'Wallet'}</b>\n` +
+                    `<code>${address.slice(0, 6)}...${address.slice(-4)}</code>\n\n` +
+                    diffs.join('\n\n────────────────────\n\n'),
+                    { parse_mode: 'HTML' }
+                  )
+                } catch (error) {
+                  console.error(`Error sending notification to user ${userId}:`, error)
+                }
+              }
+            }
+
+            previousStates[address] = newState
+          } catch (error) {
+            console.error(`Error processing address ${address}:`, error)
+          }
+        })()
+      )
+    }
+    
+    // Ждем завершения всех запросов
+    await Promise.allSettled(allPromises)
+    saveState(previousStates)
+    
+    // Периодически очищаем кеш
+    if (cache.size > 1000) {
+      cache.clear()
+    }
+    
+  } catch (error) {
+    console.error('Error in monitoring loop:', error)
   }
-  
-  whitelist.push(targetUserId)
-  saveWhitelist(whitelist)
-  ctx.reply(`✅ Added user ${targetUserId} to whitelist.`)
+}, CONFIG.CHECK_INTERVAL)
+
+// Периодически сохраняем rate limits
+setInterval(() => {
+  const limitsObj = Object.fromEntries(rateLimits)
+  saveRateLimits(limitsObj)
+}, 30000)
+
+// Загружаем rate limits при старте
+const savedLimits = loadRateLimits()
+Object.entries(savedLimits).forEach(([userId, data]) => {
+  rateLimits.set(parseInt(userId), data)
 })
 
-bot.command('whitelist_remove', ctx => {
-  if (!isOwner(ctx.from.id)) return ctx.reply('❌ Only bot owner can use this command.')
-  
-  const targetUserId = parseInt(ctx.message.text.split(' ')[1])
-  if (!targetUserId) return ctx.reply('Usage: /whitelist_remove user_id')
-  
-  const whitelist = loadWhitelist()
-  const index = whitelist.indexOf(targetUserId)
-  if (index === -1) {
-    return ctx.reply(`User ${targetUserId} is not in whitelist.`)
-  }
-  
-  whitelist.splice(index, 1)
-  saveWhitelist(whitelist)
-  ctx.reply(`✅ Removed user ${targetUserId} from whitelist.`)
+// Handle graceful shutdown
+process.once('SIGINT', () => {
+  console.log('Shutting down gracefully...')
+  saveState(previousStates)
+  saveRateLimits(Object.fromEntries(rateLimits))
+  bot.stop('SIGINT')
 })
 
-bot.command('whitelist_list', ctx => {
-  if (!isOwner(ctx.from.id)) return ctx.reply('❌ Only bot owner can use this command.')
-  
-  const whitelist = loadWhitelist()
-  if (whitelist.length === 0) {
-    return ctx.reply('Whitelist is empty.')
-  }
-  
-  const formatted = whitelist.map(id => `• ${id}`).join('\n')
-  ctx.reply(`📋 *Whitelisted users (${whitelist.length}):*\n\n${formatted}`, { parse_mode: 'Markdown' })
+process.once('SIGTERM', () => {
+  console.log('Shutting down gracefully...')
+  saveState(previousStates)
+  saveRateLimits(Object.fromEntries(rateLimits))
+  bot.stop('SIGTERM')
 })
 
-bot.command('whitelist_check', ctx => {
-  if (!isOwner(ctx.from.id)) return ctx.reply('❌ Only bot owner can use this command.')
-  
-  const targetUserId = parseInt(ctx.message.text.split(' ')[1])
-  if (!targetUserId) return ctx.reply('Usage: /whitelist_check user_id')
-  
-  const whitelisted = isWhitelisted(targetUserId)
-  const limits = getUserLimits(targetUserId)
-  
-  let message = `👤 *User ${targetUserId} Status:*\n\n`
-  message += `Status: ${whitelisted ? '👑 Whitelisted' : '👤 Regular'}\n`
-  message += `Max addresses: ${limits.maxAddresses === Infinity ? '∞' : limits.maxAddresses}\n`
-  message += `Rate limit: ${limits.rateLimit === Infinity ? '∞' : limits.rateLimit} req/min`
-  
-  ctx.reply(message, { parse_mode: 'Markdown' })
+bot.launch()
+
+// Инициализация whitelist при запуске
+loadWhitelist()
+
+console.log('✅ Bot is running with silent whitelist support...')
+console.log(`📊 Config: ${CONFIG.MAX_ADDRESSES_PER_USER} addresses/user, ${CONFIG.RATE_LIMIT_PER_USER} requests/min, ${CONFIG.CHECK_INTERVAL/1000}s intervals`)
+console.log(`📄 Whitelist file: ${WHITELIST_FILE} (add user IDs to this file for unlimited access)`)
