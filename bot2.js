@@ -446,39 +446,55 @@ bot.command('start', ctx => {
 })
 
 bot.command('check', async ctx => {
-  const userId = ctx.from.id
-  const input = ctx.message.text.split(' ')[1]
-  if (!input) return ctx.reply('Please provide address or label.')
-  
-  const watchlist = loadWatchlist()
-  const userAddresses = watchlist[userId] || {}
-  const match = Object.entries(userAddresses).find(([addr, lbl]) => lbl === input || addr === input)
-  const address = match?.[0]
-  const label = match?.[1] || 'Unnamed'
-  
-  if (!address) return ctx.reply('Address or label not found in your watchlist.')
-
-  try {
-    const data = await fetchPositions(address)
-    const formatted = formatPositionsMobile(data.positions)
-
-    // Рассчитываем среднее плечо
-    const totalPositionValue = Object.values(data.positions)
-      .reduce((sum, pos) => sum + (pos.position_value || 0), 0)
-
-    const avgLeverage = data.balance > 0 ? (totalPositionValue / data.balance) : 0
-    
-    let header = `📊 <b>${label}</b>\n`
-    header += `<code>${address.slice(0, 6)}...${address.slice(-4)}</code>\n`
-    header += `Balance: <code>$${data.balance.toFixed(2)}</code>\n`
-    header += `Avg Leverage: <code>${avgLeverage.toFixed(2)}x</code>\n`
-    header += '\n━━━━━━━━━━━━━━━━━━━━\n\n'
-
-    ctx.reply(header + formatted, { parse_mode: 'HTML' })
-  } catch (error) {
-    console.error('Error in check command:', error)
-    ctx.reply('❌ Error fetching positions. Please try again later.')
+  // 1. парсим ключ (адрес или метка)
+  const parts = ctx.message.text.trim().split(/\s+/)
+  const key = parts[1]
+  if (!key) {
+    return ctx.reply('используй: /check <адрес или метка>')
   }
+
+  // 2. ищем address и label в watchlist
+  const watchlist = loadWatchlist()
+  const userList = watchlist[ctx.from.id] || {}
+  let address, label
+
+  const checksum = safeToChecksumAddress(key)
+  if (checksum) {
+    address = checksum
+    label = userList[address] || key
+  } else {
+    const found = Object.entries(userList).find(([, lbl]) => lbl === key)
+    if (!found) {
+      return ctx.reply('адрес или метка не найдены')
+    }
+    address = found[0]
+    label = key
+  }
+
+  // 3. получаем данные
+  const data = await fetchPositions(address)
+  const formatted = formatPositionsMobile(data.positions)
+
+  // 4. считаем общее кол‑во лонгов и шортов
+  const longs = Object.values(data.positions).filter(p => p.sign === 1)
+  const shorts = Object.values(data.positions).filter(p => p.sign === -1)
+  const longsCount  = Object.values(data.positions).filter(p => p.sign === 1).length
+  const shortsCount = Object.values(data.positions).filter(p => p.sign === -1).length
+  const longsValue  = longs.reduce((s, p) => s + (p.position_value || 0), 0)
+  const shortsValue = shorts.reduce((s, p) => s + (p.position_value || 0), 0)
+
+  // 5. формируем заголовок
+  let header = `📊 <b>${label}</b>\n`
+  header += `<code>${address.slice(0,6)}...${address.slice(-4)}</code>\n`
+  header += `Balance: <code>$${data.balance.toFixed(2)}</code>\n`
+  header += `Avg Leverage: <code>${(Object.values(data.positions)
+    .reduce((s,p)=>s+(p.position_value||0),0) / data.balance || 0).toFixed(2)}x</code>\n`
+  header += `Longs/Shorts count: <code>${longsCount}/${shortsCount}</code>\n`
+  header += `Longs/Shorts value: <code>$${longsValue.toFixed(2)}/$${shortsValue.toFixed(2)}</code>\n`
+  header += '\n━━━━━━━━━━━━━━━━━━━━\n\n'
+
+  // 6. отправляем ответ
+  ctx.reply(header + formatted, { parse_mode: 'HTML' })
 })
 
 bot.command('add', async ctx => {
