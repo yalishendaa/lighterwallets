@@ -5,7 +5,6 @@ const { renderChart } = require('./render')
 
 const bot = new Telegraf(process.env.BOT_TOKEN)
 
-// Порядок и список всех слотов, где может сидеть пара
 const EXCHANGES = [
   'binance-futures',
   'binance',
