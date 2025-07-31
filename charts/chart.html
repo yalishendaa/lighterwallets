@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+  <style>
+    body { margin:0; background:#000; }
+    #chart { width:800px; height:400px; position:relative; }
+    #info {
+      position:absolute; top:10px; left:10px;
+      color:#ccc; font-family:sans-serif; font-size:14px; z-index:10;
+    }
+  </style>
+</head>
+<body>
+  <div id="chart">
+    <div id="info">__TICKER__ __INTERVAL__ — __EXCHANGE__</div>
+  </div>
+  <script>
+    const candles = __DATA__
+
+    const high = Math.max(...candles.map(c=>c.high))
+    const low  = Math.min(...candles.map(c=>c.low))
+
+    const chart = LightweightCharts.createChart(
+      document.getElementById('chart'),
+      {
+        layout:    { background:{color:'#000'}, textColor:'#ccc' },
+        grid:      { vertLines:{color:'#222'}, horzLines:{color:'#222'} },
+        timeScale: { timeVisible:true },
+        priceScale:{ borderColor:'#444', scaleMargins:{top:0.1,bottom:0.1} }
+      }
+    )
+
+    const series = chart.addCandlestickSeries({
+      upColor:'#26a69a', downColor:'#ef5350',
+      borderVisible:false, wickUpColor:'#26a69a', wickDownColor:'#ef5350'
+    })
+
+    series.setData(candles.map(d=>({
+      time:d.time, open:d.open, high:d.high, low:d.low, close:d.close
+    })))
+
+    chart.priceScale('right').applyOptions({
+      autoScale: false,
+      minValue: low * 0.99,
+      maxValue: high * 1.1
+    })
+
+    chart.timeScale().fitContent()
+  </script>
+</body>
+</html>
