@@ -3,6 +3,9 @@ const fetch = require('node-fetch')
 const { Telegraf } = require('telegraf')
 const fs = require('fs')
 const { toChecksumAddress } = require('web3-utils')
+const path = require('path')
+const { getCandles } = require('./tgcharts/candles')
+const { renderChart } = require('./tgcharts/render')
 
 const BOT_TOKEN = process.env.BOT_TOKEN
 const API_URL_BASE = "https://mainnet.zklighter.elliot.ai/api/v1/account?by=l1_address&value="
@@ -43,6 +46,18 @@ const requestQueue = []
 // Rate limiting
 const rateLimits = new Map()
 
+// Храним события покупок/продаж отдельно для каждого кошелька
+// Структура: { address: { symbol: [events] } }
+const tradeEventsByWallet = {}
+
+function normalizeSymbol(raw, exch) {
+  raw = raw.toUpperCase()
+  if (exch.startsWith('hyperliquid')) {
+    return raw.includes('-') ? raw : raw + '-USD'
+  }
+  return raw.endsWith('USDT') ? raw : raw + 'USDT'
+}
+
 function safeToChecksumAddress(input) {
   try {
     return toChecksumAddress(input)
@@ -59,6 +74,67 @@ function calculatePnLPercentage(pnl, entryPrice, position) {
   if (!entryPrice || !position || entryPrice === 0 || position === 0) return null
   const positionValue = entryPrice * position
   return (pnl / positionValue) * 100
+}
+
+// Функция для получения событий конкретного кошелька и символа
+function getWalletEvents(address, symbol) {
+  if (!tradeEventsByWallet[address]) {
+    tradeEventsByWallet[address] = {}
+  }
+  if (!tradeEventsByWallet[address][symbol]) {
+    tradeEventsByWallet[address][symbol] = []
+  }
+  return tradeEventsByWallet[address][symbol]
+}
+
+// Функция для добавления события торговли
+function addTradeEvent(address, symbol, event) {
+  const events = getWalletEvents(address, symbol)
+  events.push(event)
+  
+  // Чистим старые события >24ч для этого кошелька и символа
+  const now = Date.now() / 1000
+  tradeEventsByWallet[address][symbol] = events.filter(e => now - e.time < 86400)
+}
+
+// Функция для очистки событий закрытого кошелька
+function cleanupWalletEvents(address) {
+  if (tradeEventsByWallet[address]) {
+    delete tradeEventsByWallet[address]
+  }
+}
+
+// Функция для определения типа операции для маркеров на графике
+function getTradeTypeForChart(oldPos, newPos, symbol) {
+  // Если позиция открылась
+  if (!oldPos && newPos) {
+    return newPos.sign === 1 ? 'buy' : 'sell'
+  }
+  
+  // Если позиция закрылась
+  if (oldPos && !newPos) {
+    // При закрытии позиции происходит обратная операция
+    return oldPos.sign === 1 ? 'sell' : 'buy'
+  }
+  
+  // Если позиция изменилась по размеру
+  if (oldPos && newPos && oldPos.position !== newPos.position) {
+    const oldSize = oldPos.position
+    const newSize = newPos.position
+    const positionSign = newPos.sign // 1 = LONG, -1 = SHORT
+    
+    if (newSize > oldSize) {
+      // Позиция увеличилась - добавляем в том же направлении
+      return positionSign === 1 ? 'buy' : 'sell'
+    } else if (newSize < oldSize) {
+      // Позиция уменьшилась - частичное закрытие (обратная операция)
+      // LONG уменьшается = SELL
+      // SHORT уменьшается = BUY
+      return positionSign === 1 ? 'sell' : 'buy'
+    }
+  }
+  
+  return null // нет изменений по размеру
 }
 
 function loadState() {
@@ -557,10 +633,14 @@ bot.command('delete', ctx => {
   // Проверяем, отслеживает ли кто-то еще этот адрес
   const stillTracked = Object.values(watchlist).some(userAddr => userAddr[addr])
   
-  // Если никто больше не отслеживает этот адрес, удаляем его из состояния
-  if (!stillTracked && previousStates[addr]) {
-    delete previousStates[addr]
-    saveState(previousStates)
+  // Если никто больше не отслеживает этот адрес, удаляем его из состояния И событий
+  if (!stillTracked) {
+    if (previousStates[addr]) {
+      delete previousStates[addr]
+      saveState(previousStates)
+    }
+    // Очищаем события торговли для этого кошелька
+    cleanupWalletEvents(addr)
   }
   
   const limits = getUserLimits(userId)
@@ -588,72 +668,115 @@ bot.command('list', ctx => {
   ctx.reply(`📋 *Your tracked wallets (${maxDisplay}):*\n\n${formatted}`, { parse_mode: 'Markdown' })
 })
 
-// Мониторинг
+// ОБНОВЛЕННЫЙ МОНИТОРИНГ с разделением по кошелькам
 setInterval(async () => {
   try {
     const watchlist = loadWatchlist()
-    const allPromises = []
-    
-    // Собираем все адреса от всех пользователей
     const addressToUsers = new Map()
-    Object.entries(watchlist).forEach(([userId, userAddresses]) => {
-      Object.keys(userAddresses).forEach(address => {
-        if (!addressToUsers.has(address)) {
-          addressToUsers.set(address, [])
-        }
-        addressToUsers.get(address).push(userId)
+
+    Object.entries(watchlist).forEach(([userId, addrs]) => {
+      Object.keys(addrs).forEach(addr => {
+        if (!addressToUsers.has(addr)) addressToUsers.set(addr, [])
+        addressToUsers.get(addr).push({ userId, label: addrs[addr] || 'Wallet' })
       })
     })
-    
-    // Проверяем каждый уникальный адрес только один раз
-    for (const [address, userIds] of addressToUsers) {
-      allPromises.push(
-        (async () => {
-          try {
-            const newState = await fetchPositions(address)
-            const oldState = previousStates[address] || { positions: {} }
-            const diffs = comparePositions(oldState, newState)
 
-            if (diffs.length > 0) {
-              // Отправляем уведомления всем пользователям, отслеживающим этот адрес
-              for (const userId of userIds) {
-                try {
-                  const userAddresses = watchlist[userId] || {}
-                  
-                  await bot.telegram.sendMessage(
-                    userId,
-                    `📍 <b>${userAddresses[address] || 'Wallet'}</b>\n` +
-                    `<code>${address.slice(0, 6)}...${address.slice(-4)}</code>\n\n` +
-                    diffs.join('\n\n────────────────────\n\n'),
-                    { parse_mode: 'HTML' }
-                  )
-                } catch (error) {
-                  console.error(`Error sending notification to user ${userId}:`, error)
-                }
-              }
-            }
+    await Promise.allSettled(
+      Array.from(addressToUsers.entries()).map(async ([address, userObjs]) => {
+        const newState = await fetchPositions(address)
+        const oldState = previousStates[address] || { positions: {} }
+        const diffs = comparePositions(oldState, newState)
+        if (!diffs.length) {
+          previousStates[address] = newState
+          return
+        }
 
-            previousStates[address] = newState
-          } catch (error) {
-            console.error(`Error processing address ${address}:`, error)
+        for (const diff of diffs) {
+          // разбор действия
+          const symMatch = diff.match(/<b>(\w+)<\/b>/)
+          if (!symMatch) continue
+          const sym = symMatch[1]
+
+          const oldPos = oldState.positions[sym]
+          const newPos = newState.positions[sym]
+          const currentPos = newPos || oldPos
+          if (!currentPos) continue
+
+          // Определяем правильный тип операции для графика
+          const tradeType = getTradeTypeForChart(oldPos, newPos, sym)
+          
+          if (tradeType) {
+            // Сохраняем событие для КОНКРЕТНОГО кошелька
+            addTradeEvent(address, sym, {
+              time: Math.floor(Date.now() / 1000),
+              price: currentPos.avg_entry_price,
+              side: tradeType
+            })
           }
-        })()
-      )
-    }
-    
-    // Ждем завершения всех запросов
-    await Promise.allSettled(allPromises)
+
+          // получаем свечи
+          let candles = await getCandles(`${sym}USDT`, 1, 'binance-futures')
+          if (!candles.length) continue
+
+          // Получаем события ТОЛЬКО для этого кошелька и символа
+          const walletEvents = getWalletEvents(address, sym)
+
+          // рендер графика с маркерами только этого кошелька
+          const imgBuffer = await renderChart({
+            candles,
+            ticker: `${sym}USDT`,
+            interval: '1m',
+            exchange: 'BINANCE FUTURES',
+            avgLine: currentPos.avg_entry_price,
+            events: walletEvents // события только этого кошелька!
+          })
+
+          // отправляем пользователям этого кошелька
+          for (const { userId, label } of userObjs) {
+            const caption =
+              `📍 <b>${label}</b>\n` +
+              `<code>${address.slice(0, 6)}...${address.slice(-4)}</code>\n\n` +
+              `${diff}`
+
+            await bot.telegram.sendPhoto(userId, { source: imgBuffer }, {
+              caption,
+              parse_mode: 'HTML'
+            })
+          }
+        }
+
+        previousStates[address] = newState
+      })
+    )
+
     saveState(previousStates)
-    
-    // Периодически очищаем кеш
-    if (cache.size > 1000) {
-      cache.clear()
-    }
-    
-  } catch (error) {
-    console.error('Error in monitoring loop:', error)
+  } catch (err) {
+    console.error('Monitor error:', err)
   }
 }, CONFIG.CHECK_INTERVAL)
+
+// Периодическая очистка старых событий для всех кошельков
+setInterval(() => {
+  const now = Date.now() / 1000
+  
+  Object.keys(tradeEventsByWallet).forEach(address => {
+    Object.keys(tradeEventsByWallet[address]).forEach(symbol => {
+      tradeEventsByWallet[address][symbol] = tradeEventsByWallet[address][symbol].filter(
+        e => now - e.time < 86400
+      )
+      
+      // Удаляем пустые массивы событий
+      if (tradeEventsByWallet[address][symbol].length === 0) {
+        delete tradeEventsByWallet[address][symbol]
+      }
+    })
+    
+    // Удаляем пустые объекты кошельков
+    if (Object.keys(tradeEventsByWallet[address]).length === 0) {
+      delete tradeEventsByWallet[address]
+    }
+  })
+}, 3600000) // каждый час
 
 // Периодически сохраняем rate limits
 setInterval(() => {
