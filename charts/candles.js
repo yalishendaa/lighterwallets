@@ -8,8 +8,8 @@ async function getCandles(symbol = 'BTCUSDT', resolution = 60, exchange = 'binan
     ? 24 * 60 * 60 * 1000          // 1D = сутки
     : Number(resolution) * 60_000  // минуты
 
-  const begin = end - msPerCandle * 100  // 100 свечей/дней
-
+  const begin = end - msPerCandle * 100 
+  
   const url  = `https://velo.xyz/api/m/range`
              + `?exchange=${exchange}`
              + `&symbol=${symbol}`
