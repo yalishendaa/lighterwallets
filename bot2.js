@@ -29,13 +29,17 @@ bot.telegram.setMyCommands([
   { command: 'add', description: 'Add address with optional label (max 5)' },
   { command: 'delete', description: 'Remove address from tracking' },
   { command: 'list', description: 'Show all your tracked addresses' },
-  { command: 'check', description: 'Show positions for address or label' }
+  { command: 'check', description: 'Show positions for address or label' },
+  { command: 'pnl', description: 'Show PnL statistics for address or label' },
+  { command: 'trades', description: 'Show recent trade history for address or label' },
+  { command: 'export', description: 'Export PnL data to CSV format' }
 ])
 
 const STATE_FILE = './state.json'
 const WATCHLIST_FILE = './watchlist.json'
 const RATE_LIMIT_FILE = './rate_limits.json'
 const WHITELIST_FILE = './whitelist.json'
+const PNL_FILE = './pnl_tracking.json'
 
 // Кеш для API запросов
 const cache = new Map()
@@ -49,6 +53,20 @@ const rateLimits = new Map()
 // Храним события покупок/продаж отдельно для каждого кошелька
 // Структура: { address: { symbol: [events] } }
 const tradeEventsByWallet = {}
+
+// Структура для отслеживания PnL кошельков
+// { address: { 
+//   totalPnL: number, 
+//   realizedPnL: number, 
+//   unrealizedPnL: number, 
+//   trades: number, 
+//   startTime: number,
+//   initialBalance: number,
+//   lastBalance: number,
+//   tradeHistory: [{ symbol, side, size, entryPrice, exitPrice, pnl, timestamp }],
+//   balanceHistory: [{ balance, timestamp }]
+// } }
+const walletPnL = {}
 
 function normalizeSymbol(raw, exch) {
   raw = raw.toUpperCase()
@@ -201,6 +219,240 @@ function loadWhitelist() {
       console.error('Error creating whitelist file:', error)
     }
     return emptyWhitelist
+  }
+}
+
+// Функции для работы с PnL кошельков
+function loadWalletPnL() {
+  try {
+    const data = JSON.parse(fs.readFileSync(PNL_FILE))
+    return typeof data === 'object' && data !== null ? data : {}
+  } catch {
+    return {}
+  }
+}
+
+function saveWalletPnL(pnlData) {
+  try {
+    fs.writeFileSync(PNL_FILE, JSON.stringify(pnlData, null, 2))
+  } catch (error) {
+    console.error('Error saving wallet PnL:', error)
+  }
+}
+
+// Инициализация PnL для нового кошелька
+function initializeWalletPnL(address, initialBalance = 0) {
+  if (!walletPnL[address]) {
+    walletPnL[address] = {
+      totalPnL: 0,
+      realizedPnL: 0,
+      unrealizedPnL: 0,
+      trades: 0,
+      startTime: Date.now(),
+      initialBalance: initialBalance,
+      lastBalance: initialBalance,
+      tradeHistory: [],
+      balanceHistory: [{ balance: initialBalance, timestamp: Date.now() }]
+    }
+  }
+}
+
+// Обновление PnL при изменении позиций
+function updateWalletPnL(address, oldState, newState) {
+  initializeWalletPnL(address, newState?.balance || 0)
+  
+  const oldPositions = oldState?.positions || {}
+  const newPositions = newState?.positions || {}
+  const oldBalance = oldState?.balance || 0
+  const newBalance = newState?.balance || 0
+  
+  // Рассчитываем unrealized PnL из текущих позиций
+  let currentUnrealizedPnL = 0
+  Object.values(newPositions).forEach(pos => {
+    currentUnrealizedPnL += pos.unrealized_pnl || 0
+  })
+  
+  // Анализируем изменения позиций для определения сделок
+  const allSymbols = new Set([...Object.keys(oldPositions), ...Object.keys(newPositions)])
+  
+  allSymbols.forEach(symbol => {
+    const oldPos = oldPositions[symbol]
+    const newPos = newPositions[symbol]
+    
+    // Если позиция закрылась - это закрытие сделки
+    if (oldPos && !newPos) {
+      const trade = {
+        symbol,
+        side: oldPos.sign === 1 ? 'LONG' : 'SHORT',
+        size: oldPos.position,
+        entryPrice: oldPos.avg_entry_price,
+        exitPrice: oldPos.mark_price || oldPos.avg_entry_price,
+        pnl: oldPos.unrealized_pnl || 0,
+        timestamp: Date.now(),
+        type: 'close'
+      }
+      
+      walletPnL[address].tradeHistory.push(trade)
+      walletPnL[address].realizedPnL += trade.pnl
+      walletPnL[address].trades++
+    }
+    
+    // Если позиция открылась - это открытие сделки
+    if (!oldPos && newPos) {
+      const trade = {
+        symbol,
+        side: newPos.sign === 1 ? 'LONG' : 'SHORT',
+        size: newPos.position,
+        entryPrice: newPos.avg_entry_price,
+        exitPrice: null,
+        pnl: 0,
+        timestamp: Date.now(),
+        type: 'open'
+      }
+      
+      walletPnL[address].tradeHistory.push(trade)
+    }
+    
+    // Если позиция изменилась по размеру
+    if (oldPos && newPos && oldPos.position !== newPos.position) {
+      const sizeDiff = Math.abs(newPos.position - oldPos.position)
+      const isIncrease = newPos.position > oldPos.position
+      
+      if (isIncrease) {
+        // Увеличение позиции - новая сделка
+        const trade = {
+          symbol,
+          side: newPos.sign === 1 ? 'LONG' : 'SHORT',
+          size: sizeDiff,
+          entryPrice: newPos.avg_entry_price,
+          exitPrice: null,
+          pnl: 0,
+          timestamp: Date.now(),
+          type: 'increase'
+        }
+        walletPnL[address].tradeHistory.push(trade)
+      } else {
+        // Уменьшение позиции - частичное закрытие
+        const trade = {
+          symbol,
+          side: oldPos.sign === 1 ? 'LONG' : 'SHORT',
+          size: sizeDiff,
+          entryPrice: oldPos.avg_entry_price,
+          exitPrice: newPos.mark_price || oldPos.avg_entry_price,
+          pnl: (oldPos.unrealized_pnl || 0) * (sizeDiff / oldPos.position), // пропорциональная часть PnL
+          timestamp: Date.now(),
+          type: 'partial_close'
+        }
+        walletPnL[address].tradeHistory.push(trade)
+        walletPnL[address].realizedPnL += trade.pnl
+        walletPnL[address].trades++
+      }
+    }
+  })
+  
+  // Обновляем баланс и unrealized PnL
+  walletPnL[address].unrealizedPnL = currentUnrealizedPnL
+  walletPnL[address].lastBalance = newBalance
+  walletPnL[address].totalPnL = walletPnL[address].realizedPnL + currentUnrealizedPnL
+  
+  // Добавляем запись в историю баланса
+  walletPnL[address].balanceHistory.push({
+    balance: newBalance,
+    timestamp: Date.now()
+  })
+  
+  // Очищаем старую историю (оставляем последние 1000 записей)
+  if (walletPnL[address].balanceHistory.length > 1000) {
+    walletPnL[address].balanceHistory = walletPnL[address].balanceHistory.slice(-1000)
+  }
+  if (walletPnL[address].tradeHistory.length > 1000) {
+    walletPnL[address].tradeHistory = walletPnL[address].tradeHistory.slice(-1000)
+  }
+}
+
+// Получение статистики PnL для кошелька
+function getWalletPnLStats(address) {
+  if (!walletPnL[address]) {
+    return null
+  }
+  
+  const stats = walletPnL[address]
+  const trackingDuration = Date.now() - stats.startTime
+  const daysTracked = trackingDuration / (1000 * 60 * 60 * 24)
+  
+  // Рассчитываем дополнительные метрики
+  const closedTrades = stats.tradeHistory.filter(t => t.type === 'close' || t.type === 'partial_close')
+  const winningTrades = closedTrades.filter(t => t.pnl > 0)
+  const losingTrades = closedTrades.filter(t => t.pnl < 0)
+  
+  const winRate = closedTrades.length > 0 ? (winningTrades.length / closedTrades.length * 100).toFixed(1) : 0
+  const avgWin = winningTrades.length > 0 ? (winningTrades.reduce((sum, t) => sum + t.pnl, 0) / winningTrades.length).toFixed(2) : 0
+  const avgLoss = losingTrades.length > 0 ? (losingTrades.reduce((sum, t) => sum + t.pnl, 0) / losingTrades.length).toFixed(2) : 0
+  
+  // Рассчитываем максимальную просадку
+  let maxDrawdown = 0
+  let peak = stats.initialBalance
+  let currentDrawdown = 0
+  
+  stats.balanceHistory.forEach(record => {
+    const totalValue = record.balance + (stats.tradeHistory
+      .filter(t => t.timestamp <= record.timestamp && t.type !== 'close' && t.type !== 'partial_close')
+      .reduce((sum, t) => sum + (t.pnl || 0), 0))
+    
+    if (totalValue > peak) {
+      peak = totalValue
+      currentDrawdown = 0
+    } else {
+      currentDrawdown = (peak - totalValue) / peak * 100
+      if (currentDrawdown > maxDrawdown) {
+        maxDrawdown = currentDrawdown
+      }
+    }
+  })
+  
+  // Рассчитываем дополнительные метрики риска
+  const profitFactor = losingTrades.length > 0 ? 
+    (winningTrades.reduce((sum, t) => sum + t.pnl, 0) / Math.abs(losingTrades.reduce((sum, t) => sum + t.pnl, 0))).toFixed(2) : 
+    (winningTrades.length > 0 ? '∞' : 'N/A')
+  
+  const expectancy = closedTrades.length > 0 ? 
+    ((winningTrades.reduce((sum, t) => sum + t.pnl, 0) + losingTrades.reduce((sum, t) => sum + t.pnl, 0)) / closedTrades.length).toFixed(2) : 
+    'N/A'
+  
+  // Рассчитываем среднее время удержания позиций (если есть достаточно данных)
+  let avgHoldTime = 0
+  if (closedTrades.length > 0) {
+    const holdTimes = closedTrades.map(trade => {
+      // Ищем соответствующую открывающую сделку
+      const openTrade = stats.tradeHistory.find(t => 
+        t.symbol === trade.symbol && 
+        t.side === trade.side && 
+        t.type === 'open' && 
+        t.timestamp < trade.timestamp
+      )
+      return openTrade ? (trade.timestamp - openTrade.timestamp) / (1000 * 60 * 60) : 0 // в часах
+    }).filter(time => time > 0)
+    
+    if (holdTimes.length > 0) {
+      avgHoldTime = (holdTimes.reduce((sum, time) => sum + time, 0) / holdTimes.length).toFixed(1)
+    }
+  }
+  
+  return {
+    ...stats,
+    daysTracked: daysTracked.toFixed(1),
+    avgPnLPerDay: daysTracked > 0.1 ? (stats.totalPnL / daysTracked).toFixed(2) : 'N/A',
+    avgPnLPerTrade: closedTrades.length > 0 ? (stats.realizedPnL / closedTrades.length).toFixed(2) : 0,
+    winRate,
+    avgWin,
+    avgLoss,
+    maxDrawdown: maxDrawdown.toFixed(2),
+    totalTrades: closedTrades.length,
+    winningTrades: winningTrades.length,
+    losingTrades: losingTrades.length,
+    profitFactor,
+    expectancy,
+    avgHoldTime
   }
 }
 
@@ -473,7 +725,7 @@ function comparePositions(oldPos, newPos) {
       let msg = formatPositionUpdate(sym, n, action)
       
       // Добавляем информацию об изменении
-      msg += `\n\n📊 <b>Changes:</b>`
+      msg += `\n📊 <b>Changes:</b>\n`
       msg += `\n• Size: <code>${o.position} → ${n.position}</code>`
       
       if (o.avg_entry_price !== n.avg_entry_price) {
@@ -512,11 +764,15 @@ bot.command('start', ctx => {
     '/add <address> [label] — Add address to your watchlist (max 5)\n' +
     '/delete <address|label> — Remove from your watchlist\n' +
     '/list — Show all your tracked addresses\n' +
-    '/check <address|label> — Show current positions\n\n' +
+    '/check <address|label> — Show current positions\n' +
+    '/pnl <address|label> — Show PnL statistics since tracking started\n' +
+    '/trades <address|label> [count] — Show recent trade history\n' +
+    '/export <address|label> — Export PnL data to CSV\n\n' +
     '*Limits:*\n' +
     `• Maximum ${CONFIG.MAX_ADDRESSES_PER_USER} addresses per user\n` +
     `• Maximum ${CONFIG.RATE_LIMIT_PER_USER} commands per minute\n` +
-    '• Position updates every 15 seconds'
+    '• Position updates every 15 seconds\n' +
+    '• PnL tracking starts from when you add the wallet'
   
   ctx.reply(helpMessage, { parse_mode: 'Markdown' })
 })
@@ -526,7 +782,7 @@ bot.command('check', async ctx => {
   const parts = ctx.message.text.trim().split(/\s+/)
   const key = parts[1]
   if (!key) {
-    return ctx.reply('используй: /check <адрес или метка>')
+    return ctx.reply('use /check <address or label>')
   }
 
   // 2. ищем address и label в watchlist
@@ -541,7 +797,7 @@ bot.command('check', async ctx => {
   } else {
     const found = Object.entries(userList).find(([, lbl]) => lbl === key)
     if (!found) {
-      return ctx.reply('адрес или метка не найдены')
+      return ctx.reply('address or label not found')
     }
     address = found[0]
     label = key
@@ -573,6 +829,248 @@ bot.command('check', async ctx => {
   ctx.reply(header + formatted, { parse_mode: 'HTML' })
 })
 
+bot.command('pnl', async ctx => {
+  // 1. парсим ключ (адрес или метка)
+  const parts = ctx.message.text.trim().split(/\s+/)
+  const key = parts[1]
+  if (!key) {
+    return ctx.reply('use /pnl <address or label>')
+  }
+
+  // 2. ищем address и label в watchlist
+  const watchlist = loadWatchlist()
+  const userList = watchlist[ctx.from.id] || {}
+  let address, label
+
+  const checksum = safeToChecksumAddress(key)
+  if (checksum) {
+    address = checksum
+    label = userList[address] || key
+  } else {
+    const found = Object.entries(userList).find(([, lbl]) => lbl === key)
+    if (!found) {
+      return ctx.reply('address or label not found')
+    }
+    address = found[0]
+    label = key
+  }
+
+  // 3. получаем текущие данные и статистику PnL
+  const data = await fetchPositions(address)
+  const pnlStats = getWalletPnLStats(address)
+
+  if (!pnlStats) {
+    return ctx.reply('❌ PnL statistics not available for this wallet. Maybe tracking started recently.')
+  }
+
+  // Проверяем, началось ли отслеживание совсем недавно
+  const daysTracked = parseFloat(pnlStats.daysTracked)
+  if (daysTracked < 0.1) {
+    let message = `💰 <b>PnL Statistics: ${label}</b> <code>${address.slice(0,6)}...${address.slice(-4)}</code>\n\n`
+    message += `⚠️ <b>Tracking just started!</b>\n\n`
+    message += `<b>Tracking:</b> ${pnlStats.daysTracked} days\n`
+    message += `<b>Current balance:</b> <code>$${data.balance.toFixed(2)}</code>\n`
+    message += `<b>Unrealized PnL:</b> <code>${(pnlStats.unrealizedPnL >= 0 ? '+' : '') + pnlStats.unrealizedPnL.toFixed(2)}$</code>\n\n`
+    message += `<i>Statistics will be available after some trading activity and time passes.</i>`
+    
+    return ctx.reply(message, { parse_mode: 'HTML' })
+  }
+
+  // 4. формируем сообщение со статистикой
+  const totalPnLFormatted = (pnlStats.totalPnL >= 0 ? '+' : '') + pnlStats.totalPnL.toFixed(2)
+  const realizedPnLFormatted = (pnlStats.realizedPnL >= 0 ? '+' : '') + pnlStats.realizedPnL.toFixed(2)
+  const unrealizedPnLFormatted = (pnlStats.unrealizedPnL >= 0 ? '+' : '') + pnlStats.unrealizedPnL.toFixed(2)
+  const avgPnLPerDayFormatted = pnlStats.avgPnLPerDay === 'N/A' ? 'N/A' : (parseFloat(pnlStats.avgPnLPerDay) >= 0 ? '+' : '') + pnlStats.avgPnLPerDay
+  const avgPnLPerTradeFormatted = (parseFloat(pnlStats.avgPnLPerTrade) >= 0 ? '+' : '') + pnlStats.avgPnLPerTrade
+  const avgWinFormatted = (parseFloat(pnlStats.avgWin) >= 0 ? '+' : '') + pnlStats.avgWin
+  const avgLossFormatted = pnlStats.avgLoss
+
+  let message = `💰 <b>PnL Statistics: ${label}</b>\n`
+  message += `<code>${address.slice(0,6)}...${address.slice(-4)}</code>\n\n`
+  
+  message += `<b>Tracking:</b> ${pnlStats.daysTracked} days\n`
+  message += `<b>Closed trades:</b> ${pnlStats.totalTrades}\n`
+  message += `<b>Win rate:</b> ${pnlStats.winRate}% (${pnlStats.winningTrades}/${pnlStats.totalTrades})\n\n`
+  
+  message += `<b>Total PnL:</b> <code>${totalPnLFormatted}$</code>\n`
+  message += `<b>Realized:</b> <code>${realizedPnLFormatted}$</code>\n`
+  message += `<b>Unrealized:</b> <code>${unrealizedPnLFormatted}$</code>\n\n`
+  
+  message += `<b>Average PnL/trade:</b> <code>${avgPnLPerTradeFormatted}$</code>\n`
+  message += `<b>Average win:</b> <code>${avgWinFormatted}$</code>\n`
+  message += `<b>Average loss:</b> <code>${avgLossFormatted}$</code>\n\n`
+  
+  message += `<b>Max drawdown:</b> <code>${pnlStats.maxDrawdown}%</code>\n`
+  message += `<b>Current balance:</b> <code>$${data.balance.toFixed(2)}</code>\n\n`
+  
+  // Добавляем дополнительные метрики риска
+  message += `<b>Additional metrics:</b>\n`
+  message += `<b>Profit Factor:</b> <code>${pnlStats.profitFactor}</code>\n`
+  message += `<b>Expectancy:</b> <code>${pnlStats.expectancy === 'N/A' ? 'N/A' : pnlStats.expectancy + '$'}</code>\n`
+  if (pnlStats.avgHoldTime > 0) {
+    message += `<b>Average holding time:</b> <code>${pnlStats.avgHoldTime}h</code>\n`
+  }
+  
+  // Добавляем процентную доходность если есть данные
+  if (data.balance > 0 && pnlStats.totalPnL !== 0) {
+    const totalReturnPercent = (pnlStats.totalPnL / data.balance) * 100
+    const totalReturnFormatted = (totalReturnPercent >= 0 ? '+' : '') + totalReturnPercent.toFixed(2)
+    message += `📊 <b>Total return:</b> <code>${totalReturnFormatted}%</code>`
+  }
+
+  ctx.reply(message, { parse_mode: 'HTML' })
+})
+
+bot.command('trades', async ctx => {
+  // 1. парсим ключ (адрес или метка)
+  const parts = ctx.message.text.trim().split(/\s+/)
+  const key = parts[1]
+  if (!key) {
+    return ctx.reply('use /trades <address or label> [count]')
+  }
+
+  // 2. ищем address и label в watchlist
+  const watchlist = loadWatchlist()
+  const userList = watchlist[ctx.from.id] || {}
+  let address, label
+
+  const checksum = safeToChecksumAddress(key)
+  if (checksum) {
+    address = checksum
+    label = userList[address] || key
+  } else {
+    const found = Object.entries(userList).find(([, lbl]) => lbl === key)
+    if (!found) {
+      return ctx.reply('address or label not found')
+    }
+    address = found[0]
+    label = key
+  }
+
+  // 3. получаем историю сделок
+  const pnlStats = getWalletPnLStats(address)
+  if (!pnlStats || !pnlStats.tradeHistory) {
+    return ctx.reply('❌ Trade history not available for this wallet.')
+  }
+
+  // 4. определяем количество сделок для показа
+  const limit = parseInt(parts[2]) || 10
+  const maxLimit = Math.min(limit, 20) // максимум 20 сделок
+  
+  // 5. фильтруем только закрытые сделки и сортируем по времени
+  const closedTrades = pnlStats.tradeHistory
+    .filter(t => t.type === 'close' || t.type === 'partial_close')
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, maxLimit)
+
+  if (closedTrades.length === 0) {
+    return ctx.reply('📭 No closed trades to display.')
+  }
+
+  // 6. формируем сообщение
+  let message = `📊 <b>Trade history: ${label}</b>\n`
+  message += `<code>${address.slice(0,6)}...${address.slice(-4)}</code>\n`
+  message += `Shown: ${closedTrades.length} of ${pnlStats.tradeHistory.filter(t => t.type === 'close' || t.type === 'partial_close').length}\n\n`
+
+  closedTrades.forEach((trade, index) => {
+    const date = new Date(trade.timestamp).toLocaleString('ru-RU', {
+      day: '2-digit',
+      month: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit'
+    })
+    
+    const pnlFormatted = (trade.pnl >= 0 ? '+' : '') + trade.pnl.toFixed(2)
+    const sideEmoji = trade.side === 'LONG' ? '📗' : '📕'
+    const pnlEmoji = trade.pnl >= 0 ? '✅' : '❌'
+    
+    message += `${index + 1}. ${sideEmoji} <b>${trade.symbol}</b> ${trade.side}\n`
+    message += `   Size: <code>${trade.size}</code>\n`
+    message += `   Entry: <code>$${trade.entryPrice}</code>\n`
+    message += `   Exit: <code>$${trade.exitPrice}</code>\n`
+    message += `   ${pnlEmoji} PnL: <code>${pnlFormatted}$</code>\n`
+    message += `   📅 ${date}\n\n`
+  })
+
+  ctx.reply(message, { parse_mode: 'HTML' })
+})
+
+bot.command('export', async ctx => {
+  // 1. парсим ключ (адрес или метка)
+  const parts = ctx.message.text.trim().split(/\s+/)
+  const key = parts[1]
+  if (!key) {
+    return ctx.reply('use /export <address or label>')
+  }
+
+  // 2. ищем address и label в watchlist
+  const watchlist = loadWatchlist()
+  const userList = watchlist[ctx.from.id] || {}
+  let address, label
+
+  const checksum = safeToChecksumAddress(key)
+  if (checksum) {
+    address = checksum
+    label = userList[address] || key
+  } else {
+    const found = Object.entries(userList).find(([, lbl]) => lbl === key)
+    if (!found) {
+      return ctx.reply('address or label not found')
+    }
+    address = found[0]
+    label = key
+  }
+
+  // 3. получаем данные PnL
+  const pnlStats = getWalletPnLStats(address)
+  if (!pnlStats || !pnlStats.tradeHistory) {
+    return ctx.reply('❌ PnL data not available for this wallet.')
+  }
+
+  // 4. создаем CSV файл
+  const csvData = []
+  
+  // Заголовок
+  csvData.push('Date,Symbol,Side,Size,Entry Price,Exit Price,PnL,Type')
+  
+  // Данные сделок
+  const closedTrades = pnlStats.tradeHistory
+    .filter(t => t.type === 'close' || t.type === 'partial_close')
+    .sort((a, b) => a.timestamp - b.timestamp)
+  
+  closedTrades.forEach(trade => {
+    const date = new Date(trade.timestamp).toISOString()
+    const side = trade.side === 'LONG' ? 'LONG' : 'SHORT'
+    const type = trade.type === 'close' ? 'Close' : 'Partial Close'
+    
+    csvData.push(`${date},${trade.symbol},${side},${trade.size},${trade.entryPrice},${trade.exitPrice},${trade.pnl},${type}`)
+  })
+  
+  const csvContent = csvData.join('\n')
+  const filename = `pnl_${address.slice(0,8)}_${Date.now()}.csv`
+  
+  try {
+    // Создаем временный файл
+    fs.writeFileSync(filename, csvContent)
+    
+    // Отправляем файл
+    await ctx.replyWithDocument({ source: filename }, {
+      caption: `📊 Export PnL data for ${label}\n\n` +
+        `📅 Period: ${pnlStats.daysTracked} days\n` +
+        `🔄 Trades: ${closedTrades.length}\n` +
+        `📈 Total PnL: ${(pnlStats.totalPnL >= 0 ? '+' : '') + pnlStats.totalPnL.toFixed(2)}$\n` +
+        `📊 Win rate: ${pnlStats.winRate}%`
+    })
+    
+    // Удаляем временный файл
+    fs.unlinkSync(filename)
+  } catch (error) {
+    console.error('Error exporting CSV:', error)
+    ctx.reply('❌ Error creating export file.')
+  }
+})
+
+
 bot.command('add', async ctx => {
   const userId = ctx.from.id
   const input = ctx.message.text.split(' ').slice(1)
@@ -595,23 +1093,48 @@ bot.command('add', async ctx => {
   }
 
   const label = input[1] || null
+  
+  // Сначала получаем текущее состояние позиций
+  let initialState
+  try {
+    ctx.reply('🔄 Adding wallet and fetching initial state...')
+    initialState = await fetchPositions(address)
+  } catch (error) {
+    console.error('Error fetching initial state for new address:', error)
+    return ctx.reply('❌ Failed to fetch wallet data. Please check the address and try again.')
+  }
+
+  // Только после успешного получения данных добавляем в watchlist
   userAddresses[address] = label
   watchlist[userId] = userAddresses
   saveWatchlist(watchlist)
   
-  // Инициализируем состояние для нового адреса, чтобы избежать ложных уведомлений
-  try {
-    const initialState = await fetchPositions(address)
-    previousStates[address] = initialState
-    saveState(previousStates)
-    
-    const maxDisplay = limits.maxAddresses === Infinity ? Object.keys(userAddresses).length : `${Object.keys(userAddresses).length}/${CONFIG.MAX_ADDRESSES_PER_USER}`
-    ctx.reply(`✅ Added ${address}${label ? ' as ' + label : ''}\n\nAddresses: ${maxDisplay}\n\n🔄 Monitoring started - you'll receive updates for any position changes.`)
-  } catch (error) {
-    console.error('Error initializing state for new address:', error)
-    const maxDisplay = limits.maxAddresses === Infinity ? Object.keys(userAddresses).length : `${Object.keys(userAddresses).length}/${CONFIG.MAX_ADDRESSES_PER_USER}`
-    ctx.reply(`✅ Added ${address}${label ? ' as ' + label : ''}\n\nAddresses: ${maxDisplay}\n\n⚠️ Warning: Could not fetch initial state. You may receive notifications about existing positions on first check.`)
+  // Инициализируем состояние ОБЯЗАТЕЛЬНО
+  previousStates[address] = initialState
+  saveState(previousStates)
+  
+  // Инициализируем PnL для нового кошелька
+  initializeWalletPnL(address, initialState.balance)
+  
+  const maxDisplay = limits.maxAddresses === Infinity ? Object.keys(userAddresses).length : `${Object.keys(userAddresses).length}/${CONFIG.MAX_ADDRESSES_PER_USER}`
+  
+  // Показываем текущие позиции при добавлении
+  const formatted = formatPositionsMobile(initialState.positions)
+  const positionsCount = Object.keys(initialState.positions).length
+  
+  let successMessage = `✅ Added ${address}${label ? ' as ' + label : ''}\n\n`
+  successMessage += `Addresses: ${maxDisplay}\n`
+  successMessage += `Current positions: ${positionsCount}\n\n`
+  
+  if (positionsCount > 0) {
+    successMessage += `📊 <b>Current state:</b>\n`
+    successMessage += `Balance: <code>$${initialState.balance.toFixed(2)}</code>\n\n`
+    successMessage += formatted + '\n\n'
   }
+  
+  successMessage += `🔄 Monitoring started - you'll receive updates only for position changes.`
+  
+  ctx.reply(successMessage, { parse_mode: 'HTML' })
 })
 
 bot.command('delete', ctx => {
@@ -641,6 +1164,10 @@ bot.command('delete', ctx => {
     }
     // Очищаем события торговли для этого кошелька
     cleanupWalletEvents(addr)
+    // Очищаем PnL данные для этого кошелька
+    if (walletPnL[addr]) {
+      delete walletPnL[addr]
+    }
   }
   
   const limits = getUserLimits(userId)
@@ -668,7 +1195,7 @@ bot.command('list', ctx => {
   ctx.reply(`📋 *Your tracked wallets (${maxDisplay}):*\n\n${formatted}`, { parse_mode: 'Markdown' })
 })
 
-// ОБНОВЛЕННЫЙ МОНИТОРИНГ с разделением по кошелькам
+// УЛУЧШЕННЫЙ МОНИТОРИНГ с защитой от ложных уведомлений
 setInterval(async () => {
   try {
     const watchlist = loadWatchlist()
@@ -684,12 +1211,27 @@ setInterval(async () => {
     await Promise.allSettled(
       Array.from(addressToUsers.entries()).map(async ([address, userObjs]) => {
         const newState = await fetchPositions(address)
-        const oldState = previousStates[address] || { positions: {} }
+        const oldState = previousStates[address]
+        
+        // КРИТИЧЕСКИ ВАЖНО: если нет предыдущего состояния, просто сохраняем текущее
+        // без отправки уведомлений (это может быть новый кошелек или сбой системы)
+        if (!oldState) {
+          console.log(`Initializing state for ${address} - no notifications will be sent`)
+          previousStates[address] = newState
+          saveState(previousStates)
+          return
+        }
+
         const diffs = comparePositions(oldState, newState)
         if (!diffs.length) {
           previousStates[address] = newState
           return
         }
+
+        console.log(`Position changes detected for ${address}: ${diffs.length} updates`)
+
+        // Обновляем PnL кошелька при изменениях позиций
+        updateWalletPnL(address, oldState, newState)
 
         for (const diff of diffs) {
           // разбор действия
@@ -715,7 +1257,7 @@ setInterval(async () => {
           }
 
           // получаем свечи
-          let candles = await getCandles(`${sym}USDT`, 1, 'binance-futures')
+          let candles = await getCandles(`${sym}USDT`, 5, 'binance-futures')
           if (!candles.length) continue
 
           // Получаем события ТОЛЬКО для этого кошелька и символа
@@ -725,7 +1267,7 @@ setInterval(async () => {
           const imgBuffer = await renderChart({
             candles,
             ticker: `${sym}USDT`,
-            interval: '1m',
+            interval: '5m',
             exchange: 'BINANCE FUTURES',
             avgLine: currentPos.avg_entry_price,
             events: walletEvents // события только этого кошелька!
@@ -733,15 +1275,18 @@ setInterval(async () => {
 
           // отправляем пользователям этого кошелька
           for (const { userId, label } of userObjs) {
-            const caption =
-              `📍 <b>${label}</b>\n` +
-              `<code>${address.slice(0, 6)}...${address.slice(-4)}</code>\n\n` +
-              `${diff}`
+            try {
+              const caption =
+                `📍 <b>${label}</b> ` + ` <code>${address.slice(0, 6)}...${address.slice(-4)}</code>\n\n` +
+                `${diff}`
 
-            await bot.telegram.sendPhoto(userId, { source: imgBuffer }, {
-              caption,
-              parse_mode: 'HTML'
-            })
+              await bot.telegram.sendPhoto(userId, { source: imgBuffer }, {
+                caption,
+                parse_mode: 'HTML'
+              })
+            } catch (sendError) {
+              console.error(`Error sending notification to user ${userId}:`, sendError.message)
+            }
           }
         }
 
@@ -784,17 +1329,48 @@ setInterval(() => {
   saveRateLimits(limitsObj)
 }, 30000)
 
+// Периодически сохраняем PnL данные
+setInterval(() => {
+  saveWalletPnL(walletPnL)
+}, 60000) // каждую минуту
+
+// Периодическая очистка старых данных PnL (старше 30 дней)
+setInterval(() => {
+  const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000)
+  
+  Object.keys(walletPnL).forEach(address => {
+    const stats = walletPnL[address]
+    
+    // Очищаем старую историю сделок
+    if (stats.tradeHistory) {
+      stats.tradeHistory = stats.tradeHistory.filter(trade => trade.timestamp > thirtyDaysAgo)
+    }
+    
+    // Очищаем старую историю баланса
+    if (stats.balanceHistory) {
+      stats.balanceHistory = stats.balanceHistory.filter(record => record.timestamp > thirtyDaysAgo)
+    }
+  })
+  
+  console.log('🧹 Old PnL data cleared (older than 30 days)')
+}, 24 * 60 * 60 * 1000) // раз в день
+
 // Загружаем rate limits при старте
 const savedLimits = loadRateLimits()
 Object.entries(savedLimits).forEach(([userId, data]) => {
   rateLimits.set(parseInt(userId), data)
 })
 
+// Загружаем PnL данные при старте
+const savedPnL = loadWalletPnL()
+Object.assign(walletPnL, savedPnL)
+
 // Handle graceful shutdown
 process.once('SIGINT', () => {
   console.log('Shutting down gracefully...')
   saveState(previousStates)
   saveRateLimits(Object.fromEntries(rateLimits))
+  saveWalletPnL(walletPnL)
   bot.stop('SIGINT')
 })
 
@@ -802,6 +1378,7 @@ process.once('SIGTERM', () => {
   console.log('Shutting down gracefully...')
   saveState(previousStates)
   saveRateLimits(Object.fromEntries(rateLimits))
+  saveWalletPnL(walletPnL)
   bot.stop('SIGTERM')
 })
 
@@ -810,6 +1387,8 @@ bot.launch()
 // Инициализация whitelist при запуске
 loadWhitelist()
 
-console.log('✅ Bot is running with silent whitelist support...')
+console.log('✅ Bot is running with enhanced PnL tracking...')
 console.log(`📊 Config: ${CONFIG.MAX_ADDRESSES_PER_USER} addresses/user, ${CONFIG.RATE_LIMIT_PER_USER} requests/min, ${CONFIG.CHECK_INTERVAL/1000}s intervals`)
 console.log(`📄 Whitelist file: ${WHITELIST_FILE} (add user IDs to this file for unlimited access)`)
+console.log(`💰 Enhanced PnL tracking enabled with trade history and risk metrics`)
+console.log(`📈 Available commands: /pnl, /trades, /export for detailed analysis`)
